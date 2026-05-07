@@ -1,0 +1,8 @@
+streamlit==1.43.2
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.6.1
+gensim==4.3.3
+nltk==3.9.1
+requests==2.32.3
+Pillow==10.4.0

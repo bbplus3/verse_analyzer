@@ -1,0 +1,470 @@
+import os
+import warnings
+
+import gensim
+import nltk
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+from gensim.models import Word2Vec
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+warnings.filterwarnings("ignore")
+
+# Download NLTK data once at startup
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
+nltk.download("stopwords", quiet=True)
+
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Bible Verse Recommender and Visualization", layout="wide")
+
+# ── Shared stopword list (avoids repeated nltk.corpus calls) ─────────────────
+from nltk.corpus import stopwords as _sw
+STOP_WORDS = set(_sw.words("english"))
+
+# ── Book name maps ────────────────────────────────────────────────────────────
+ALL_BOOK_NAMES = {
+    1: "Genesis", 2: "Exodus", 3: "Leviticus", 4: "Numbers", 5: "Deuteronomy",
+    6: "Joshua", 7: "Judges", 8: "Ruth", 9: "1 Samuel", 10: "2 Samuel",
+    11: "1 Kings", 12: "2 Kings", 13: "1 Chronicles", 14: "2 Chronicles",
+    15: "Ezra", 16: "Nehemiah", 17: "Esther", 18: "Job", 19: "Psalms",
+    20: "Proverbs", 21: "Ecclesiastes", 22: "Song of Solomon", 23: "Isaiah",
+    24: "Jeremiah", 25: "Lamentations", 26: "Ezekiel", 27: "Daniel",
+    28: "Hosea", 29: "Joel", 30: "Amos", 31: "Obadiah", 32: "Jonah",
+    33: "Micah", 34: "Nahum", 35: "Habakkuk", 36: "Zephaniah", 37: "Haggai",
+    38: "Zechariah", 39: "Malachi", 40: "Matthew", 41: "Mark", 42: "Luke",
+    43: "John", 44: "Acts", 45: "Romans", 46: "1 Corinthians",
+    47: "2 Corinthians", 48: "Galatians", 49: "Ephesians", 50: "Philippians",
+    51: "Colossians", 52: "1 Thessalonians", 53: "2 Thessalonians",
+    54: "1 Timothy", 55: "2 Timothy", 56: "Titus", 57: "Philemon",
+    58: "Hebrews", 59: "James", 60: "1 Peter", 61: "2 Peter",
+    62: "1 John", 63: "2 John", 64: "3 John", 65: "Jude", 66: "Revelation",
+}
+
+PROPHETS_NAMES = {k: v for k, v in ALL_BOOK_NAMES.items() if k <= 39}
+
+FULFILLED_NAMES = {k: v for k, v in ALL_BOOK_NAMES.items() if k >= 40}
+
+
+def clean_corpus(series):
+    return series.astype(str).str.lower().apply(
+        lambda x: " ".join(w for w in x.split() if w not in STOP_WORDS)
+    )
+
+
+# ── Data loaders ──────────────────────────────────────────────────────────────
+@st.cache_data
+def load_data():
+    df = pd.read_csv("t_bbe.csv").dropna()
+    df["Book Name"] = df["b"].map(ALL_BOOK_NAMES)
+    df["corpus"] = clean_corpus(df["t"])
+    return df, ALL_BOOK_NAMES
+
+
+@st.cache_data
+def load_prophets():
+    df = pd.read_csv("t_bbe.csv").dropna()
+    df["Book Name"] = df["b"].map(PROPHETS_NAMES)
+    df["corpus"] = clean_corpus(df["t"])
+    return df, PROPHETS_NAMES
+
+
+@st.cache_data
+def load_fulfilled():
+    df = pd.read_csv("t_bbe.csv").dropna()
+    df["Book Name"] = df["b"].map(FULFILLED_NAMES)
+    df["corpus"] = clean_corpus(df["t"])
+    return df, FULFILLED_NAMES
+
+
+data, book_names = load_data()
+prophets, prophets_names = load_prophets()
+fulfilled, fulfilled_names = load_fulfilled()
+
+book_numbers = {v: k for k, v in book_names.items()}
+prophets_book_numbers = {v: k for k, v in prophets_names.items()}
+
+# ── TF-IDF similarity matrices ────────────────────────────────────────────────
+@st.cache_resource
+def compute_tfidf_similarity(corpus_series):
+    matrix = TfidfVectorizer().fit_transform(corpus_series)
+    return cosine_similarity(matrix)
+
+
+similarity_matrix = compute_tfidf_similarity(data["corpus"])
+similarity_matrix_prophecy = compute_tfidf_similarity(fulfilled["corpus"])
+
+# ── Word2Vec (trained on bible text, lightweight) ─────────────────────────────
+@st.cache_resource
+def load_word2vec(_df):
+    sentences = [nltk.word_tokenize(t.lower()) for t in _df["t"]]
+    return Word2Vec(sentences, vector_size=100, window=5, min_count=1, workers=4)
+
+
+w2v_model = load_word2vec(data)
+
+# ── Semantic embeddings via HuggingFace Inference API (no local model) ────────
+# Uses sentence-transformers/all-MiniLM-L6-v2 hosted on HF — same model, zero
+# local weight. Requires HF_TOKEN in Streamlit secrets.
+
+@st.cache_data(show_spinner=False)
+def load_verse_embeddings() -> np.ndarray:
+    """
+    Downloads precomputed MiniLM embeddings from Google Drive on first run,
+    then caches them in Streamlit's data cache for the session.
+    Shape: (31103, 384), float32, L2-normalised.
+    """
+    import io, urllib.request
+    emb_file = "bible_embeddings.npy"
+    if not os.path.exists(emb_file):
+        with st.spinner("Downloading verse embeddings (first run only)…"):
+            # gdown is gone — use a direct urllib download instead
+            gdrive_url = (
+                "https://drive.google.com/uc?export=download"
+                "&id=1-z5RDrWKn13t65PmsWb4FhOGyRcJbOpB"
+            )
+            urllib.request.urlretrieve(gdrive_url, emb_file)
+    emb = np.load(emb_file, allow_pickle=True).astype(np.float32)
+    norms = np.linalg.norm(emb, axis=1, keepdims=True).clip(min=1e-9)
+    return emb / norms  # L2-normalised: dot product == cosine similarity
+
+
+def get_query_embedding(text: str) -> np.ndarray:
+    """
+    Encodes a query string via the HuggingFace Inference API (feature-extraction).
+    Returns a normalised float32 vector of shape (1, 384).
+    """
+    hf_token = st.secrets.get("HF_TOKEN", "")
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    api_url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+
+    try:
+        resp = requests.post(
+            api_url,
+            headers=headers,
+            json={"inputs": text, "options": {"wait_for_model": True}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        vec = np.array(resp.json(), dtype=np.float32)
+        # HF returns shape (1, 384) or (384,) — normalise either way
+        vec = vec.reshape(1, -1)
+        vec = vec / np.linalg.norm(vec, keepdims=True).clip(min=1e-9)
+        return vec
+    except requests.exceptions.Timeout:
+        st.error("⚠️ Embedding model is loading on HuggingFace. Try again in ~20 seconds.")
+        return None
+    except Exception as e:
+        st.error(f"⚠️ Embedding error: {e}")
+        return None
+
+
+def find_similar_verses(query: str, top_n: int = 5) -> pd.DataFrame:
+    embeddings = load_verse_embeddings()
+    q_vec = get_query_embedding(query)
+    if q_vec is None:
+        return pd.DataFrame(columns=["Book Name", "c", "v", "t", "Similarity"])
+    scores = (embeddings @ q_vec.T).flatten()
+    top_idx = np.argsort(scores)[::-1][:top_n]
+    results = data.iloc[top_idx][["Book Name", "c", "v", "t"]].copy()
+    results["Similarity"] = scores[top_idx]
+    results.columns = ["Book Name", "c", "v", "t", "Similarity"]
+    return results.reset_index(drop=True)
+
+
+
+# ── Tab 2: TF-IDF verse recommender ──────────────────────────────────────────
+def top_verse(input_book, input_chapter, input_verse, top_n=10):
+    try:
+        book_num = str(book_numbers.get(input_book, ""))
+        locator = data.loc[
+            (data["b"].astype(str) == book_num)
+            & (data["c"].astype(str) == str(input_chapter))
+            & (data["v"].astype(str) == str(input_verse))
+        ]
+        if locator.empty:
+            return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
+        idx = locator.index[0]
+        scores = sorted(enumerate(similarity_matrix[idx]), key=lambda x: x[1], reverse=True)
+        sim_idx = [i[0] for i in scores[1 : top_n + 1]]
+        sim_val = [i[1] for i in scores[1 : top_n + 1]]
+        rec = data.iloc[sim_idx].copy()
+        rec["Similarity Score"] = sim_val
+        rec = rec[["Book Name", "c", "v", "t", "Similarity Score"]]
+        rec.columns = ["Book", "Chapter", "Verse", "Text", "Similarity Score"]
+        return rec
+    except Exception as e:
+        st.error(f"Error in recommendation: {e}")
+        return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
+
+
+# ── Tab 5: Prophecy recommender ───────────────────────────────────────────────
+def top_verse_prophecy(input_book, input_chapter, input_verse, top_n=10):
+    try:
+        book_num = str(prophets_book_numbers.get(input_book, ""))
+        locator = prophets.loc[
+            (prophets["b"].astype(str) == book_num)
+            & (prophets["c"].astype(str) == str(input_chapter))
+            & (prophets["v"].astype(str) == str(input_verse))
+        ]
+        if locator.empty:
+            return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
+        idx = locator.index[0]
+        scores = sorted(
+            enumerate(similarity_matrix_prophecy[idx]), key=lambda x: x[1], reverse=True
+        )
+        sim_idx = [i[0] for i in scores[1 : top_n + 1]]
+        sim_val = [i[1] for i in scores[1 : top_n + 1]]
+        rec = fulfilled.iloc[sim_idx].copy()
+        rec["Similarity Score"] = sim_val
+        rec = rec[["Book Name", "c", "v", "t", "Similarity Score"]]
+        rec.columns = ["Book", "Chapter", "Verse", "Text", "Similarity Score"]
+        return rec[rec["Book"].notna()]
+    except Exception as e:
+        st.error(f"Error in prophecy recommendation: {e}")
+        return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
+
+
+# ── Tab 3: RAG summary via HuggingFace Inference API (replaces distilgpt2) ───
+def rag_generate(query: str, results_df: pd.DataFrame) -> str:
+    """
+    Generates a thematic reflection using the HuggingFace Inference API.
+    Requires HF_TOKEN set in Streamlit secrets (st.secrets["HF_TOKEN"]).
+    Falls back gracefully if the token is missing.
+    """
+    hf_token = st.secrets.get("HF_TOKEN", "")
+    if not hf_token:
+        return (
+            "⚠️ No Hugging Face token found. Add `HF_TOKEN` to your Streamlit secrets "
+            "to enable AI-generated reflections."
+        )
+
+    verses = "\n".join(results_df["t"].tolist())
+    prompt = (
+        f"Based on the following Bible verses:\n\n{verses}\n\n"
+        f"Reflect on this theme: '{query}'\n\nReflection:"
+    )
+
+    api_url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": 200, "do_sample": True, "temperature": 0.7},
+    }
+
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        if isinstance(result, list) and result:
+            generated = result[0].get("generated_text", "")
+            # Return only the new text after the prompt
+            return generated[len(prompt):].strip() or generated.strip()
+        return str(result)
+    except requests.exceptions.Timeout:
+        return "⚠️ The model is loading on HuggingFace servers. Try again in ~20 seconds."
+    except Exception as e:
+        return f"⚠️ Error generating reflection: {e}"
+
+
+# ── Tab 4: Image generation via HuggingFace Inference API (replaces SD) ──────
+def generate_image(prompt: str, width: int, height: int):
+    """
+    Generates an image via the HuggingFace Inference API (FLUX.1-schnell).
+    Requires HF_TOKEN in Streamlit secrets.
+    Returns a PIL Image or None on failure.
+    """
+    hf_token = st.secrets.get("HF_TOKEN", "")
+    if not hf_token:
+        st.warning(
+            "⚠️ No Hugging Face token found. Add `HF_TOKEN` to your Streamlit secrets "
+            "to enable image generation."
+        )
+        return None
+
+    api_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    payload = {"inputs": prompt, "parameters": {"width": width, "height": height}}
+
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        from PIL import Image
+        import io
+        return Image.open(io.BytesIO(resp.content))
+    except requests.exceptions.Timeout:
+        st.warning("⚠️ Image model is loading. Please try again in ~30 seconds.")
+        return None
+    except Exception as e:
+        st.error(f"⚠️ Image generation error: {e}")
+        return None
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Table of Contents", "Verse Recommender", "Semantic Search Recommender", "Create Image", "Prophecy"]
+)
+
+# ── Tab 1: Table of contents ──────────────────────────────────────────────────
+with tab1:
+    st.title("📖 Bible Application")
+    st.write("**Tab 2: Verse Recommender** ➡️ Find other verses similar to a verse selection from the Old and New Testament")
+    st.write("**Tab 3: Semantic Search Recommender** ➡️ Find Bible Verses most similar to user-input words or phrases")
+    st.write("**Tab 4: Create Image** ➡️ Select a verse or passage to create an image")
+    st.write("**Tab 5: Prophecy** ➡️ Select an Old Testament Prophecy to see where it was fulfilled in the New Testament")
+
+# ── Tab 2: TF-IDF verse-to-verse recommender ─────────────────────────────────
+with tab2:
+    st.title("📖 Bible Verse Recommender")
+    st.write("Find verses similar to your selection from the Old and New Testament.")
+
+    with st.form("verse_input"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            input_book = st.selectbox("Select Book", list(book_names.values()))
+        with col2:
+            input_chapter = st.number_input("Chapter", min_value=1, max_value=150, value=1, step=1)
+        with col3:
+            input_verse = st.number_input("Verse", min_value=1, max_value=176, value=1, step=1)
+
+        top_n = st.slider("Number of Similar Verses", min_value=1, max_value=50, value=10, step=5)
+        submitted = st.form_submit_button("Find Similar Verses")
+
+    if submitted:
+        searched_verse = data.loc[
+            (data["Book Name"] == input_book)
+            & (data["c"].astype(str) == str(input_chapter))
+            & (data["v"].astype(str) == str(input_verse))
+        ]
+        if not searched_verse.empty:
+            st.write(f"**Input Verse:** {searched_verse.iloc[0]['t']}")
+            st.write("### 🔍 Similar Verses:")
+            st.table(top_verse(input_book, input_chapter, input_verse, top_n))
+        else:
+            st.warning("Verse not found. Check the chapter and verse numbers.")
+
+# ── Tab 3: Semantic search + Word2Vec expansion + RAG summary ─────────────────
+with tab3:
+    st.title("📖 Bible Verse Similarity Finder")
+
+    query = st.text_input("Enter a phrase or verse:", "Love your neighbor as yourself")
+    top_n_t3 = st.slider("Number of similar verses:", min_value=1, max_value=50, value=10, step=5)
+
+    # Word2Vec query expansion
+    query_tokens = nltk.word_tokenize(query.lower())
+    known_words = [w for w in query_tokens if w in w2v_model.wv.key_to_index]
+    similar_terms = []
+    for word in known_words:
+        similar_terms += [w for w, _ in w2v_model.wv.most_similar(word, topn=5)]
+    similar_terms = list(set(similar_terms))[:5]
+
+    if similar_terms:
+        st.write("🔍 Similar terms to expand your search:")
+        selected_terms = st.multiselect("Add terms to search", options=similar_terms)
+        expanded_query = query + (" " + " ".join(selected_terms) if selected_terms else "")
+    else:
+        expanded_query = query
+
+    if st.button("Find Similar Verses"):
+        with st.spinner("Searching…"):
+            results = find_similar_verses(expanded_query, top_n_t3)
+
+        st.write("### 🔍 Similar Verses:")
+        for _, row in results.iterrows():
+            st.write(f"**Book:** {row['Book Name']} | **Chapter:** {row['c']} | **Verse:** {row['v']}")
+            st.write(f"**Text:** {row['t']} *(Similarity: {row['Similarity']:.2f})*")
+
+        if not results.empty:
+            with st.spinner("Generating reflection…"):
+                summary = rag_generate(expanded_query, results)
+            st.markdown("### 🧠 RAG Summary")
+            st.write(summary)
+
+# ── Tab 4: Image generation ───────────────────────────────────────────────────
+with tab4:
+    st.title("🖼️ Bible Passage Text-to-Image Generator")
+    st.write("Select a verse or passage to create an image.")
+
+    with st.form("image_input"):
+        col1, col2 = st.columns(2)
+        with col1:
+            in_book = st.selectbox("Select Book", list(book_names.values()))
+            in_chapter = st.number_input("Chapter", min_value=1, max_value=150, value=1, step=1)
+        col3a, col3b = st.columns(2)
+        with col3a:
+            start_verse = st.number_input("Start Verse", min_value=1, max_value=176, value=1, step=1)
+        with col3b:
+            end_verse = st.number_input("End Verse", min_value=1, max_value=176, value=1, step=1)
+
+        col4a, col4b = st.columns(2)
+        with col4a:
+            style = st.selectbox(
+                "Select Style",
+                ["realistic", "oil painting", "digital art", "sketch", "fantasy art"],
+            )
+        with col4b:
+            resolution = st.selectbox("Image Resolution", ["512x512", "768x768"])
+
+        img_submitted = st.form_submit_button("Generate Image")
+
+    if img_submitted:
+        selected_verses = data.loc[
+            (data["Book Name"] == in_book)
+            & (data["c"].astype(str) == str(in_chapter))
+            & (data["v"].astype(int) >= start_verse)
+            & (data["v"].astype(int) <= end_verse)
+        ]
+        if not selected_verses.empty:
+            passage = " ".join(selected_verses["t"].tolist())
+            truncated = passage[:300]
+            prompt = f"{truncated}, style: {style}"
+            width, height = map(int, resolution.split("x"))
+
+            st.write(f"**Input Passage:** {passage}")
+            st.write("### 🖼️ Generated Image:")
+            with st.spinner("Generating image…"):
+                image = generate_image(prompt, width, height)
+            if image:
+                st.image(image, width=600)
+        else:
+            st.warning("Passage not found.")
+
+# ── Tab 5: Prophecy fulfillment ───────────────────────────────────────────────
+with tab5:
+    st.title("📖 Prophecy Verse Search")
+    st.write("Select an Old Testament Prophecy to see where it was fulfilled in the New Testament.")
+    st.info("Enter a Book, Chapter and Verse ➡️ click 'Find Prophecy Fulfillment Verses' to find New Testament Bible verses where Old Testament Prophecies were fulfilled.")
+    st.info("This application works best when a verse containing a prophecy is selected.")
+    st.info("Check out the links immediately below to find prophetic Old Testament verses:")
+    st.markdown("[Review Prophecies and Corresponding Fulfillment Verses](https://www.jesusfilm.org/blog/old-testament-prophecies/)")
+    st.markdown("[Example List of Prophecies](https://www.newtestamentchristians.com/bible-study-resources/351-old-testament-prophecies-fulfilled-in-jesus-christ/)")
+
+    with st.form("prophecy_input"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            p_input_book = st.selectbox("Select Book", list(prophets_names.values()))
+        with col2:
+            p_input_chapter = st.number_input("Chapter", min_value=1, max_value=150, value=1, step=1)
+        with col3:
+            p_input_verse = st.number_input("Verse", min_value=1, max_value=176, value=1, step=1)
+
+        p_submitted = st.form_submit_button("➡️ Find Prophecy Fulfillment Verses")
+
+    if p_submitted:
+        results = top_verse_prophecy(p_input_book, p_input_chapter, p_input_verse, top_n=10)
+        searched_verse = prophets.loc[
+            (prophets["Book Name"] == p_input_book)
+            & (prophets["c"].astype(str) == str(p_input_chapter))
+            & (prophets["v"].astype(str) == str(p_input_verse))
+        ]
+        if not searched_verse.empty:
+            st.write(f"**Input Verse:** {searched_verse.iloc[0]['t']}")
+            st.write("### 🔍 Corresponding Verses:")
+            for _, row in results.iterrows():
+                st.write(f"**Book:** {row['Book']} | **Chapter:** {row['Chapter']} | **Verse:** {row['Verse']}")
+                st.write(f"**Text:** {row['Text']} *(Similarity: {row['Similarity Score']:.2f})*")
+        else:
+            st.warning("Verse not found.")
