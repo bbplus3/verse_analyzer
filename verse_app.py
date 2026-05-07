@@ -1,29 +1,32 @@
 import os
 import warnings
 
-import gensim
-import nltk
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from gensim.models import Word2Vec
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 warnings.filterwarnings("ignore")
 
-# Download NLTK data once at startup
-nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
-nltk.download("stopwords", quiet=True)
-
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Bible Verse Recommender and Visualization", layout="wide")
 
-# ── Shared stopword list (avoids repeated nltk.corpus calls) ─────────────────
-from nltk.corpus import stopwords as _sw
-STOP_WORDS = set(_sw.words("english"))
+# ── Inline stopword list — no nltk needed ─────────────────────────────────────
+STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "was", "are", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "shall", "that", "this", "these",
+    "those", "it", "its", "he", "she", "they", "we", "you", "i", "me",
+    "him", "her", "them", "us", "my", "his", "our", "your", "their", "not",
+    "no", "nor", "so", "yet", "both", "either", "each", "all", "any",
+    "more", "most", "other", "such", "than", "then", "when", "where",
+    "which", "who", "whom", "what", "how", "if", "as", "up", "out", "into",
+    "about", "after", "before", "over", "under", "again", "there", "here",
+    "now", "just", "also", "very", "own", "same", "only", "because",
+}
 
 # ── Book name maps ────────────────────────────────────────────────────────────
 ALL_BOOK_NAMES = {
@@ -97,15 +100,54 @@ def compute_tfidf_similarity(corpus_series):
 similarity_matrix = compute_tfidf_similarity(data["corpus"])
 similarity_matrix_prophecy = compute_tfidf_similarity(fulfilled["corpus"])
 
-# ── Word2Vec (trained on bible text, lightweight) ─────────────────────────────
+# ── TF-IDF co-occurrence query expansion (replaces Word2Vec/gensim) ──────────
+# Builds a word-to-word co-occurrence index from the bible corpus using the
+# existing TF-IDF matrix. For any query word, finds the top words that most
+# frequently appear in the same verses — a lightweight substitute for Word2Vec
+# similar_words that needs no extra dependency.
+
 @st.cache_resource
-def load_word2vec(_df):
-    sentences = [nltk.word_tokenize(t.lower()) for t in _df["t"]]
-    return Word2Vec(sentences, vector_size=100, window=5, min_count=1, workers=4)
+def build_cooccurrence_index():
+    """
+    Returns a fitted TfidfVectorizer and its feature names, used to find
+    words that co-occur with query terms across the bible corpus.
+    """
+    vec = TfidfVectorizer(max_features=5000, min_df=3)
+    matrix = vec.fit_transform(data["corpus"])  # (n_verses, n_words)
+    # Word correlation: which words tend to appear in the same verses?
+    # word_corr[i, j] = dot product of word i and word j column vectors
+    word_corr = (matrix.T @ matrix).toarray()
+    np.fill_diagonal(word_corr, 0)  # exclude self-similarity
+    return vec.get_feature_names_out(), word_corr
 
 
-w2v_model = load_word2vec(data)
+def get_similar_terms(query: str, top_n: int = 5) -> list:
+    """
+    Given a query string, returns up to top_n words from the bible vocabulary
+    that most strongly co-occur with the query words.
+    """
+    feature_names, word_corr = build_cooccurrence_index()
+    name_to_idx = {w: i for i, w in enumerate(feature_names)}
 
+    query_words = [
+        w.lower() for w in query.split()
+        if w.lower() not in STOP_WORDS and w.isalpha()
+    ]
+    known = [w for w in query_words if w in name_to_idx]
+    if not known:
+        return []
+
+    # Sum co-occurrence scores across all known query words
+    scores = np.zeros(len(feature_names))
+    for w in known:
+        scores += word_corr[name_to_idx[w]]
+
+    # Zero out the query words themselves so they don't appear as suggestions
+    for w in known:
+        scores[name_to_idx[w]] = 0
+
+    top_idx = np.argsort(scores)[::-1][:top_n]
+    return [feature_names[i] for i in top_idx if scores[i] > 0]
 # ── Semantic embeddings via HuggingFace Inference API (no local model) ────────
 # Uses sentence-transformers/all-MiniLM-L6-v2 hosted on HF — same model, zero
 # local weight. Requires HF_TOKEN in Streamlit secrets.
@@ -353,13 +395,8 @@ with tab3:
     query = st.text_input("Enter a phrase or verse:", "Love your neighbor as yourself")
     top_n_t3 = st.slider("Number of similar verses:", min_value=1, max_value=50, value=10, step=5)
 
-    # Word2Vec query expansion
-    query_tokens = nltk.word_tokenize(query.lower())
-    known_words = [w for w in query_tokens if w in w2v_model.wv.key_to_index]
-    similar_terms = []
-    for word in known_words:
-        similar_terms += [w for w, _ in w2v_model.wv.most_similar(word, topn=5)]
-    similar_terms = list(set(similar_terms))[:5]
+    # TF-IDF co-occurrence query expansion
+    similar_terms = get_similar_terms(query, top_n=5)
 
     if similar_terms:
         st.write("🔍 Similar terms to expand your search:")
