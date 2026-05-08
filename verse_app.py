@@ -219,20 +219,13 @@ def top_verse_prophecy(input_book, input_chapter, input_verse, top_n=10):
 
 # ── Tab 3: RAG summary via HuggingFace Inference API (replaces distilgpt2) ───
 def rag_generate(query: str, results_df: pd.DataFrame) -> str:
-    """
-    Generates a thematic reflection using the HuggingFace Inference API.
-    Requires HF_TOKEN set in Streamlit secrets (st.secrets["HF_TOKEN"]).
-    Falls back gracefully if the token is missing.
-    """
-try:
-    hf_token = st.secrets["HF_TOKEN"]
-except Exception:
-    hf_token = ""
+    try:
+        hf_token = st.secrets["HF_TOKEN"]
+    except Exception:
+        hf_token = ""
+
     if not hf_token:
-        return (
-            "⚠️ No Hugging Face token found. Add `HF_TOKEN` to your Streamlit secrets "
-            "to enable AI-generated reflections."
-        )
+        return "⚠️ No Hugging Face token found..."
 
     verses = "\n".join(results_df["t"].tolist())
     prompt = (
