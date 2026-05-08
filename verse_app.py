@@ -154,74 +154,19 @@ def get_similar_terms(query: str, top_n: int = 5) -> list:
 
     top_idx = np.argsort(scores)[::-1][:top_n]
     return [feature_names[i] for i in top_idx if scores[i] > 0]
-# ── Semantic embeddings via HuggingFace Inference API (no local model) ────────
-# Uses sentence-transformers/all-MiniLM-L6-v2 hosted on HF — same model, zero
-# local weight. Requires HF_TOKEN in Streamlit secrets.
-
-@st.cache_data(show_spinner=False)
-def load_verse_embeddings() -> np.ndarray:
-    """
-    Downloads precomputed MiniLM embeddings from Google Drive on first run,
-    then caches them in Streamlit's data cache for the session.
-    Shape: (31103, 384), float32, L2-normalised.
-    """
-    import io, urllib.request
-    emb_file = "bible_embeddings.npy"
-    if not os.path.exists(emb_file):
-        with st.spinner("Downloading verse embeddings (first run only)…"):
-            # gdown is gone — use a direct urllib download instead
-            gdrive_url = (
-                "https://drive.google.com/uc?export=download"
-                "&id=1-z5RDrWKn13t65PmsWb4FhOGyRcJbOpB"
-            )
-            urllib.request.urlretrieve(gdrive_url, emb_file)
-    emb = np.load(emb_file, allow_pickle=True).astype(np.float32)
-    norms = np.linalg.norm(emb, axis=1, keepdims=True).clip(min=1e-9)
-    return emb / norms  # L2-normalised: dot product == cosine similarity
-
-
-def get_query_embedding(text: str) -> np.ndarray:
-    """
-    Encodes a query string via the HuggingFace Inference API (feature-extraction).
-    Returns a normalised float32 vector of shape (1, 384).
-    """
-    hf_token = st.secrets.get("HF_TOKEN", "")
-    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
-    api_url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
-
-    try:
-        resp = requests.post(
-            api_url,
-            headers=headers,
-            json={"inputs": text, "options": {"wait_for_model": True}},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        vec = np.array(resp.json(), dtype=np.float32)
-        # HF returns shape (1, 384) or (384,) — normalise either way
-        vec = vec.reshape(1, -1)
-        vec = vec / np.linalg.norm(vec, keepdims=True).clip(min=1e-9)
-        return vec
-    except requests.exceptions.Timeout:
-        st.error("⚠️ Embedding model is loading on HuggingFace. Try again in ~20 seconds.")
-        return None
-    except Exception as e:
-        st.error(f"⚠️ Embedding error: {e}")
-        return None
-
+# ── Semantic search via TF-IDF query transform (no external API needed) ───────
+# Transforms the user's query using the already-fitted TF-IDF vectorizer and
+# computes cosine similarity via sparse dot product against all verses.
+# Fast, free, works offline, no model download required.
 
 def find_similar_verses(query: str, top_n: int = 5) -> pd.DataFrame:
-    embeddings = load_verse_embeddings()
-    q_vec = get_query_embedding(query)
-    if q_vec is None:
-        return pd.DataFrame(columns=["Book Name", "c", "v", "t", "Similarity"])
-    scores = (embeddings @ q_vec.T).flatten()
+    q_vec = tfidf_vec.transform([query])          # sparse (1, n_features)
+    scores = (tfidf_matrix @ q_vec.T).toarray().flatten()  # (n_verses,)
     top_idx = np.argsort(scores)[::-1][:top_n]
     results = data.iloc[top_idx][["Book Name", "c", "v", "t"]].copy()
     results["Similarity"] = scores[top_idx]
     results.columns = ["Book Name", "c", "v", "t", "Similarity"]
     return results.reset_index(drop=True)
-
 
 
 # ── Tab 2: TF-IDF verse recommender ──────────────────────────────────────────
