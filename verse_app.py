@@ -224,7 +224,10 @@ def rag_generate(query: str, results_df: pd.DataFrame) -> str:
     Requires HF_TOKEN set in Streamlit secrets (st.secrets["HF_TOKEN"]).
     Falls back gracefully if the token is missing.
     """
-    hf_token = st.secrets.get("HF_TOKEN", "")
+try:
+    hf_token = st.secrets["HF_TOKEN"]
+except Exception:
+    hf_token = ""
     if not hf_token:
         return (
             "⚠️ No Hugging Face token found. Add `HF_TOKEN` to your Streamlit secrets "
