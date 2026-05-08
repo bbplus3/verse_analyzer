@@ -314,33 +314,27 @@ def rag_generate(query: str, results_df: pd.DataFrame) -> str:
         return f"⚠️ Error generating reflection: {e}"
 
 
-# ── Tab 4: Image generation via HuggingFace Inference API (replaces SD) ──────
+# ── Tab 4: Image generation via Pollinations.ai (free, no token needed) ───────
 def generate_image(prompt: str, width: int, height: int):
     """
-    Generates an image via the HuggingFace Inference API (FLUX.1-schnell).
-    Requires HF_TOKEN in Streamlit secrets.
+    Generates an image via Pollinations.ai — completely free, no API key required.
     Returns a PIL Image or None on failure.
     """
-    hf_token = st.secrets.get("HF_TOKEN", "")
-    if not hf_token:
-        st.warning(
-            "⚠️ No Hugging Face token found. Add `HF_TOKEN` to your Streamlit secrets "
-            "to enable image generation."
-        )
-        return None
+    import io
+    from PIL import Image
 
-    api_url = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2-1"
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    payload = {"inputs": prompt}
+    encoded_prompt = requests.utils.quote(prompt)
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        f"?width={width}&height={height}&nologo=true&seed={hash(prompt) % 9999}"
+    )
 
     try:
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
+        resp = requests.get(url, timeout=60)
         resp.raise_for_status()
-        from PIL import Image
-        import io
         return Image.open(io.BytesIO(resp.content))
     except requests.exceptions.Timeout:
-        st.warning("⚠️ Image model is loading. Please try again in ~30 seconds.")
+        st.warning("⚠️ Image generation timed out. Please try again.")
         return None
     except Exception as e:
         st.error(f"⚠️ Image generation error: {e}")
@@ -424,11 +418,6 @@ with tab3:
 
 # ── Tab 4: Image generation ───────────────────────────────────────────────────
 with tab4:
-    try:
-        token_preview = st.secrets["HF_TOKEN"][:8] + "..."
-        st.success(f"✅ Token loaded: {token_preview}")
-    except Exception as e:
-        st.error(f"❌ Token not found: {e}")
     st.title("🖼️ Bible Passage Text-to-Image Generator")
     st.write("Select a verse or passage to create an image.")
 
