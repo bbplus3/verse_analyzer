@@ -6,13 +6,11 @@ import pandas as pd
 import requests
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 warnings.filterwarnings("ignore")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Bible Verse Recommender and Visualization", layout="wide")
-st.write("App starting...")
 
 # ── Inline stopword list — no nltk needed ─────────────────────────────────────
 STOP_WORDS = {
@@ -91,43 +89,51 @@ fulfilled, fulfilled_names = load_fulfilled()
 book_numbers = {v: k for k, v in book_names.items()}
 prophets_book_numbers = {v: k for k, v in prophets_names.items()}
 
-# ── TF-IDF similarity matrices ────────────────────────────────────────────────
+# ── TF-IDF matrices (sparse — never materialise full N×N similarity) ─────────
+# Keeping the matrices sparse avoids the 7.5 GB dense cosine_similarity call.
+# Similarities are computed on-demand for one row at a time instead.
+
 @st.cache_resource
-def compute_tfidf_similarity(corpus_series):
-    matrix = TfidfVectorizer().fit_transform(corpus_series)
-    return cosine_similarity(matrix)
+def build_tfidf_matrix(corpus_series):
+    """Fit and return a sparse TF-IDF matrix + the fitted vectorizer."""
+    vec = TfidfVectorizer()
+    matrix = vec.fit_transform(corpus_series)
+    return matrix, vec
 
 
-similarity_matrix = compute_tfidf_similarity(data["corpus"])
-similarity_matrix_prophecy = compute_tfidf_similarity(fulfilled["corpus"])
+tfidf_matrix, tfidf_vec = build_tfidf_matrix(data["corpus"])
+tfidf_matrix_prophecy, _ = build_tfidf_matrix(fulfilled["corpus"])
 
-# ── TF-IDF co-occurrence query expansion (replaces Word2Vec/gensim) ──────────
-# Builds a word-to-word co-occurrence index from the bible corpus using the
-# existing TF-IDF matrix. For any query word, finds the top words that most
-# frequently appear in the same verses — a lightweight substitute for Word2Vec
-# similar_words that needs no extra dependency.
+
+def get_top_similar(matrix, idx: int, top_n: int):
+    """
+    Compute cosine similarity between row `idx` and all other rows,
+    using sparse dot product — memory stays flat regardless of corpus size.
+    """
+    row = matrix[idx]                          # (1, n_features) sparse
+    scores = (matrix @ row.T).toarray().flatten()  # (n_verses,)
+    scores[idx] = 0                            # exclude the input verse itself
+    top_idx = np.argsort(scores)[::-1][:top_n]
+    return top_idx, scores[top_idx]
+
+
+# ── TF-IDF co-occurrence query expansion ─────────────────────────────────────
+# Reuses the sparse TF-IDF matrix to find words that co-occur with query terms.
+# Operates on word columns (sparse), never builds a dense word×word matrix.
 
 @st.cache_resource
 def build_cooccurrence_index():
     """
-    Returns a fitted TfidfVectorizer and its feature names, used to find
-    words that co-occur with query terms across the bible corpus.
+    Returns a small vocab TF-IDF matrix and feature names for co-occurrence lookup.
+    max_features=3000 keeps the word×word dot products cheap.
     """
-    vec = TfidfVectorizer(max_features=5000, min_df=3)
-    matrix = vec.fit_transform(data["corpus"])  # (n_verses, n_words)
-    # Word correlation: which words tend to appear in the same verses?
-    # word_corr[i, j] = dot product of word i and word j column vectors
-    word_corr = (matrix.T @ matrix).toarray()
-    np.fill_diagonal(word_corr, 0)  # exclude self-similarity
-    return vec.get_feature_names_out(), word_corr
+    vec = TfidfVectorizer(max_features=3000, min_df=3)
+    matrix = vec.fit_transform(data["corpus"])  # sparse (n_verses, 3000)
+    return matrix, vec.get_feature_names_out()
 
 
 def get_similar_terms(query: str, top_n: int = 5) -> list:
-    """
-    Given a query string, returns up to top_n words from the bible vocabulary
-    that most strongly co-occur with the query words.
-    """
-    feature_names, word_corr = build_cooccurrence_index()
+    matrix, feature_names = build_cooccurrence_index()
     name_to_idx = {w: i for i, w in enumerate(feature_names)}
 
     query_words = [
@@ -138,14 +144,13 @@ def get_similar_terms(query: str, top_n: int = 5) -> list:
     if not known:
         return []
 
-    # Sum co-occurrence scores across all known query words
+    # For each known word, get its column (sparse), compute dot with all other
+    # columns — result is a dense (3000,) vector of co-occurrence scores
     scores = np.zeros(len(feature_names))
     for w in known:
-        scores += word_corr[name_to_idx[w]]
-
-    # Zero out the query words themselves so they don't appear as suggestions
-    for w in known:
-        scores[name_to_idx[w]] = 0
+        col = matrix.getcol(name_to_idx[w])          # sparse (n_verses, 1)
+        scores += (matrix.T @ col).toarray().flatten()  # (3000,)
+        scores[name_to_idx[w]] = 0  # exclude self
 
     top_idx = np.argsort(scores)[::-1][:top_n]
     return [feature_names[i] for i in top_idx if scores[i] > 0]
@@ -231,9 +236,7 @@ def top_verse(input_book, input_chapter, input_verse, top_n=10):
         if locator.empty:
             return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
         idx = locator.index[0]
-        scores = sorted(enumerate(similarity_matrix[idx]), key=lambda x: x[1], reverse=True)
-        sim_idx = [i[0] for i in scores[1 : top_n + 1]]
-        sim_val = [i[1] for i in scores[1 : top_n + 1]]
+        sim_idx, sim_val = get_top_similar(tfidf_matrix, idx, top_n)
         rec = data.iloc[sim_idx].copy()
         rec["Similarity Score"] = sim_val
         rec = rec[["Book Name", "c", "v", "t", "Similarity Score"]]
@@ -256,11 +259,9 @@ def top_verse_prophecy(input_book, input_chapter, input_verse, top_n=10):
         if locator.empty:
             return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
         idx = locator.index[0]
-        scores = sorted(
-            enumerate(similarity_matrix_prophecy[idx]), key=lambda x: x[1], reverse=True
-        )
-        sim_idx = [i[0] for i in scores[1 : top_n + 1]]
-        sim_val = [i[1] for i in scores[1 : top_n + 1]]
+        # Use the fulfilled matrix index — prophets idx maps into fulfilled rows
+        # via the shared t_bbe.csv row numbers
+        sim_idx, sim_val = get_top_similar(tfidf_matrix_prophecy, idx, top_n)
         rec = fulfilled.iloc[sim_idx].copy()
         rec["Similarity Score"] = sim_val
         rec = rec[["Book Name", "c", "v", "t", "Similarity Score"]]
