@@ -424,6 +424,11 @@ with tab3:
 
 # ── Tab 4: Image generation ───────────────────────────────────────────────────
 with tab4:
+    try:
+        token_preview = st.secrets["HF_TOKEN"][:8] + "..."
+        st.success(f"✅ Token loaded: {token_preview}")
+    except Exception as e:
+        st.error(f"❌ Token not found: {e}")
     st.title("🖼️ Bible Passage Text-to-Image Generator")
     st.write("Select a verse or passage to create an image.")
 
