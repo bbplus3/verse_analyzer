@@ -47,7 +47,6 @@ ALL_BOOK_NAMES = {
 }
 
 PROPHETS_NAMES = {k: v for k, v in ALL_BOOK_NAMES.items() if k <= 39}
-
 FULFILLED_NAMES = {k: v for k, v in ALL_BOOK_NAMES.items() if k >= 40}
 
 
@@ -89,13 +88,9 @@ fulfilled, fulfilled_names = load_fulfilled()
 book_numbers = {v: k for k, v in book_names.items()}
 prophets_book_numbers = {v: k for k, v in prophets_names.items()}
 
-# ── TF-IDF matrices (sparse — never materialise full N×N similarity) ─────────
-# Keeping the matrices sparse avoids the 7.5 GB dense cosine_similarity call.
-# Similarities are computed on-demand for one row at a time instead.
-
+# ── TF-IDF matrices (sparse — never materialise full N×N similarity) ──────────
 @st.cache_resource
 def build_tfidf_matrix(corpus_series):
-    """Fit and return a sparse TF-IDF matrix + the fitted vectorizer."""
     vec = TfidfVectorizer()
     matrix = vec.fit_transform(corpus_series)
     return matrix, vec
@@ -106,29 +101,18 @@ tfidf_matrix_prophecy, _ = build_tfidf_matrix(fulfilled["corpus"])
 
 
 def get_top_similar(matrix, idx: int, top_n: int):
-    """
-    Compute cosine similarity between row `idx` and all other rows,
-    using sparse dot product — memory stays flat regardless of corpus size.
-    """
-    row = matrix[idx]                          # (1, n_features) sparse
-    scores = (matrix @ row.T).toarray().flatten()  # (n_verses,)
-    scores[idx] = 0                            # exclude the input verse itself
+    row = matrix[idx]
+    scores = (matrix @ row.T).toarray().flatten()
+    scores[idx] = 0
     top_idx = np.argsort(scores)[::-1][:top_n]
     return top_idx, scores[top_idx]
 
 
-# ── TF-IDF co-occurrence query expansion ─────────────────────────────────────
-# Reuses the sparse TF-IDF matrix to find words that co-occur with query terms.
-# Operates on word columns (sparse), never builds a dense word×word matrix.
-
+# ── TF-IDF co-occurrence query expansion ──────────────────────────────────────
 @st.cache_resource
 def build_cooccurrence_index():
-    """
-    Returns a small vocab TF-IDF matrix and feature names for co-occurrence lookup.
-    max_features=3000 keeps the word×word dot products cheap.
-    """
     vec = TfidfVectorizer(max_features=3000, min_df=3)
-    matrix = vec.fit_transform(data["corpus"])  # sparse (n_verses, 3000)
+    matrix = vec.fit_transform(data["corpus"])
     return matrix, vec.get_feature_names_out()
 
 
@@ -144,24 +128,20 @@ def get_similar_terms(query: str, top_n: int = 5) -> list:
     if not known:
         return []
 
-    # For each known word, get its column (sparse), compute dot with all other
-    # columns — result is a dense (3000,) vector of co-occurrence scores
     scores = np.zeros(len(feature_names))
     for w in known:
-        col = matrix.getcol(name_to_idx[w])          # sparse (n_verses, 1)
-        scores += (matrix.T @ col).toarray().flatten()  # (3000,)
-        scores[name_to_idx[w]] = 0  # exclude self
+        col = matrix.getcol(name_to_idx[w])
+        scores += (matrix.T @ col).toarray().flatten()
+        scores[name_to_idx[w]] = 0
 
     top_idx = np.argsort(scores)[::-1][:top_n]
     return [feature_names[i] for i in top_idx if scores[i] > 0]
-# ── Semantic search via TF-IDF query transform (no external API needed) ───────
-# Transforms the user's query using the already-fitted TF-IDF vectorizer and
-# computes cosine similarity via sparse dot product against all verses.
-# Fast, free, works offline, no model download required.
 
+
+# ── Semantic search via TF-IDF ────────────────────────────────────────────────
 def find_similar_verses(query: str, top_n: int = 5) -> pd.DataFrame:
-    q_vec = tfidf_vec.transform([query])          # sparse (1, n_features)
-    scores = (tfidf_matrix @ q_vec.T).toarray().flatten()  # (n_verses,)
+    q_vec = tfidf_vec.transform([query])
+    scores = (tfidf_matrix @ q_vec.T).toarray().flatten()
     top_idx = np.argsort(scores)[::-1][:top_n]
     results = data.iloc[top_idx][["Book Name", "c", "v", "t"]].copy()
     results["Similarity"] = scores[top_idx]
@@ -204,8 +184,6 @@ def top_verse_prophecy(input_book, input_chapter, input_verse, top_n=10):
         if locator.empty:
             return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
         idx = locator.index[0]
-        # Use the fulfilled matrix index — prophets idx maps into fulfilled rows
-        # via the shared t_bbe.csv row numbers
         sim_idx, sim_val = get_top_similar(tfidf_matrix_prophecy, idx, top_n)
         rec = fulfilled.iloc[sim_idx].copy()
         rec["Similarity Score"] = sim_val
@@ -217,50 +195,53 @@ def top_verse_prophecy(input_book, input_chapter, input_verse, top_n=10):
         return pd.DataFrame(columns=["Book", "Chapter", "Verse", "Text", "Similarity Score"])
 
 
-# ── Tab 3: RAG summary via HuggingFace Inference API (replaces distilgpt2) ───
+# ── Tab 3: RAG summary via Anthropic API ─────────────────────────────────────
 def rag_generate(query: str, results_df: pd.DataFrame) -> str:
     try:
-        hf_token = st.secrets["HF_TOKEN"]
+        api_key = st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
-        hf_token = ""
+        api_key = ""
 
-    if not hf_token:
-        return "⚠️ No Hugging Face token found..."
+    if not api_key:
+        return (
+            "⚠️ No Anthropic API key found. Add `ANTHROPIC_API_KEY` to your "
+            "Streamlit secrets to enable AI-generated reflections."
+        )
 
     verses = "\n".join(results_df["t"].tolist())
     prompt = (
         f"Based on the following Bible verses:\n\n{verses}\n\n"
-        f"Reflect on this theme: '{query}'\n\nReflection:"
+        f"Write a short, thoughtful reflection on this theme: '{query}'"
     )
 
-    api_url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
-    headers = {"Authorization": f"Bearer {hf_token}"}
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
     payload = {
-        "inputs": prompt,
-        "parameters": {"max_new_tokens": 200, "do_sample": True, "temperature": 0.7},
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 300,
+        "messages": [{"role": "user", "content": prompt}],
     }
 
     try:
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
         resp.raise_for_status()
-        result = resp.json()
-        if isinstance(result, list) and result:
-            generated = result[0].get("generated_text", "")
-            # Return only the new text after the prompt
-            return generated[len(prompt):].strip() or generated.strip()
-        return str(result)
+        return resp.json()["content"][0]["text"].strip()
     except requests.exceptions.Timeout:
-        return "⚠️ The model is loading on HuggingFace servers. Try again in ~20 seconds."
+        return "⚠️ Request timed out. Please try again."
     except Exception as e:
         return f"⚠️ Error generating reflection: {e}"
 
 
-# ── Tab 4: Image generation via Pollinations.ai (free, no token needed) ───────
+# ── Tab 4: Image generation via Pollinations.ai ───────────────────────────────
 def generate_image(prompt: str, width: int, height: int):
-    """
-    Generates an image via Pollinations.ai — completely free, no API key required.
-    Returns a PIL Image or None on failure.
-    """
     import io
     from PIL import Image
 
@@ -325,14 +306,13 @@ with tab2:
         else:
             st.warning("Verse not found. Check the chapter and verse numbers.")
 
-# ── Tab 3: Semantic search + Word2Vec expansion + RAG summary ─────────────────
+# ── Tab 3: Semantic search + co-occurrence expansion + RAG summary ────────────
 with tab3:
     st.title("📖 Bible Verse Similarity Finder")
 
     query = st.text_input("Enter a phrase or verse:", "Love your neighbor as yourself")
     top_n_t3 = st.slider("Number of similar verses:", min_value=1, max_value=50, value=10, step=5)
 
-    # TF-IDF co-occurrence query expansion
     similar_terms = get_similar_terms(query, top_n=5)
 
     if similar_terms:
