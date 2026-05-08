@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Bible Verse Recommender and Visualization", layout="wide")
+st.write("App starting...")
 
 # ── Inline stopword list — no nltk needed ─────────────────────────────────────
 STOP_WORDS = {
