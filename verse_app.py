@@ -329,9 +329,9 @@ def generate_image(prompt: str, width: int, height: int):
         )
         return None
 
-    api_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+    api_url = "https://router.huggingface.co/fal-ai/flux/schnell"
     headers = {"Authorization": f"Bearer {hf_token}"}
-    payload = {"inputs": prompt, "parameters": {"width": width, "height": height}}
+    payload = {"inputs": prompt, "parameters": {"image_size": {"width": width, "height": height}}}
 
     try:
         resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
